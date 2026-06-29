@@ -1,10 +1,9 @@
 /**
  * Connection Manager Hook - Orchestrates WebSocket connection and conference state
- * Handles JOIN, LEAVE, ACK/NACK, and heartbeat
+ * Now uses Mock Server for frontend-only testing (backend can be added later)
  */
 
-import { useEffect, useCallback, useRef } from "react";
-import { useConferenceSocket } from "./useConferenceSocket";
+import { useEffect, useCallback, useRef, useState } from "react";
 import { useConference } from "../context/ConferenceContext";
 import {
   PacketType,
@@ -19,6 +18,7 @@ import {
   createPongPacket,
   generateSpeakerId,
 } from "../shared/packetBuilder";
+import { MockConferenceServer } from "../mock/MockConferenceServer";
 
 interface ConnectionManagerConfig {
   serverUrl: string;
@@ -27,107 +27,145 @@ interface ConnectionManagerConfig {
   onConnected?: () => void;
   onDisconnected?: () => void;
   onError?: (error: string) => void;
+  useMockServer?: boolean; // Toggle for mock vs real backend
 }
 
 export function useConnectionManager(config: ConnectionManagerConfig) {
-  const { serverUrl, roomId, userId, onConnected, onDisconnected, onError } =
-    config;
-
-  const socket = useConferenceSocket({
+  const {
     serverUrl,
-    reconnectAttempts: 5,
-    reconnectDelay: 3000,
-    heartbeatInterval: 30000,
-  });
+    roomId,
+    userId,
+    onConnected,
+    onDisconnected,
+    onError,
+    useMockServer = true, // Default: use mock server for frontend-only testing
+  } = config;
 
   const conference = useConference();
   const sequenceNumberRef = useRef(0);
   const nodeIdRef = useRef(`NODE_${Math.random().toString(36).substring(7)}`);
   const speakerIdRef = useRef<string>("");
+  const mockServerRef = useRef<MockConferenceServer | null>(null);
 
-  // ==================== INITIALIZATION ====================
+  const [connected, setConnected] = useState(false);
+  const [connecting, setConnecting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  // Message handlers storage
+  const messageHandlersRef = useRef<
+    Map<PacketType, ((packet: any) => void)[]>
+  >(new Map());
+
+  // ==================== MOCK SERVER SETUP ====================
 
   useEffect(() => {
-    if (!socket.connected) {
+    if (!useMockServer) {
+      console.log("[Connection] Real backend mode (not implemented yet)");
       return;
     }
 
-    const nodeId = nodeIdRef.current;
+    const initializeMock = async () => {
+      try {
+        setConnecting(true);
+        setError(null);
 
-    // Generate speaker ID (SP101, SP102, etc.)
-    const speakerId = generateSpeakerId(nodeId, 0);
-    speakerIdRef.current = speakerId;
+        // Create mock server
+        mockServerRef.current = new MockConferenceServer(serverUrl);
 
-    // Update conference state
-    conference.joinRoom(roomId, nodeId, userId);
-    conference.addSpeaker(speakerId, nodeId);
+        // Connect
+        await mockServerRef.current.connect();
 
-    // Send JOIN packet
-    const joinPacket = {
-      metadata: createMetadata(
-        roomId,
-        nodeId,
-        speakerId,
-        PacketType.JOIN,
-        ++sequenceNumberRef.current
-      ),
-      payload: {
-        version: "1.0",
-        room_id: roomId,
-        node_id: nodeId,
-        user_id: userId,
-        timestamp: Date.now(),
-      },
+        const nodeId = nodeIdRef.current;
+        const speakerId = generateSpeakerId(nodeId, 0);
+        speakerIdRef.current = speakerId;
+
+        // Update conference state
+        conference.joinRoom(roomId, nodeId, userId);
+        conference.addSpeaker(speakerId, nodeId);
+
+        // Subscribe to mock server responses
+        mockServerRef.current.subscribe(PacketType.ACK, (packet) => {
+          console.log("[Mock Response] ACK received:", packet);
+          handleAck(packet);
+        });
+
+        mockServerRef.current.subscribe(PacketType.NACK, (packet) => {
+          console.log("[Mock Response] NACK received:", packet);
+          handleNack(packet);
+        });
+
+        mockServerRef.current.subscribe(PacketType.PONG, (packet) => {
+          console.log("[Mock Response] PONG received");
+        });
+
+        // Simulate JOIN ACK
+        setTimeout(() => {
+          const joinAck = {
+            type: PacketType.ACK,
+            sequence_number: ++sequenceNumberRef.current,
+            message: "JOIN accepted (mock)",
+            node_id: nodeId,
+            speaker_id: speakerId,
+          };
+          handleAck(joinAck);
+        }, 300);
+
+        setConnected(true);
+        setConnecting(false);
+
+        if (onConnected) {
+          onConnected();
+        }
+
+        console.log("[Mock Connection] Connected successfully");
+      } catch (err) {
+        const errorMessage =
+          err instanceof Error ? err.message : "Connection failed";
+        setError(errorMessage);
+        setConnecting(false);
+        if (onError) {
+          onError(errorMessage);
+        }
+        console.error("[Mock Connection] Error:", errorMessage);
+      }
     };
 
-    socket.sendPacket(joinPacket);
-
-    if (onConnected) {
-      onConnected();
-    }
-
-    // Subscribe to ACK/NACK
-    const unsubscribeAck = socket.subscribe(
-      PacketType.ACK,
-      (packet: any) => {
-        handleAck(packet);
-      }
-    );
-
-    const unsubscribeNack = socket.subscribe(
-      PacketType.NACK,
-      (packet: any) => {
-        handleNack(packet);
-      }
-    );
-
-    const unsubscribePing = socket.subscribe(
-      PacketType.PING,
-      (packet: any) => {
-        handlePing(packet);
-      }
-    );
+    initializeMock();
 
     return () => {
-      unsubscribeAck();
-      unsubscribeNack();
-      unsubscribePing();
+      if (mockServerRef.current) {
+        mockServerRef.current.disconnect();
+        setConnected(false);
+        if (onDisconnected) {
+          onDisconnected();
+        }
+      }
     };
-  }, [socket.connected, roomId, userId, conference, socket, onConnected]);
+  }, [useMockServer, serverUrl, roomId, userId, conference, onConnected, onDisconnected, onError]);
+
+  // ==================== PACKET SENDING ====================
+
+  const sendPacket = useCallback((packet: any) => {
+    if (!mockServerRef.current) {
+      console.warn("[Connection] Not connected to mock server");
+      return;
+    }
+
+    console.log("[Mock Send] Packet:", packet.type || packet.payload?.type, packet);
+    mockServerRef.current.send(packet);
+  }, []);
 
   // ==================== ACK/NACK HANDLERS ====================
 
   const handleAck = useCallback((packet: any) => {
-    const ackPayload = packet.payload as AckPacket;
+    console.log("[Handler] ACK packet processed");
   }, []);
 
   const handleNack = useCallback((packet: any) => {
-    const nackPayload = packet.payload as NackPacket;
-    console.warn(
-      `NACK received for sequence ${nackPayload.failed_sequence}: ${nackPayload.reason}`
-    );
+    const reason = packet.reason || "Unknown error";
+    console.warn(`[Handler] NACK received: ${reason}`);
     if (onError) {
-      onError(`NACK: ${nackPayload.reason}`);
+      onError(`NACK: ${reason}`);
     }
   }, [onError]);
 
@@ -142,30 +180,53 @@ export function useConnectionManager(config: ConnectionManagerConfig) {
       ++sequenceNumberRef.current,
       Date.now()
     );
-    socket.sendPacket(pongPacket);
-  }, [roomId, socket]);
+    sendPacket(pongPacket);
+  }, [roomId, sendPacket]);
 
-  // ==================== CLEANUP ====================
+  // ==================== SUBSCRIBE METHOD ====================
 
-  useEffect(() => {
-    return () => {
-      if (socket.connected) {
-        socket.disconnect();
-        conference.leaveRoom();
-        if (onDisconnected) {
-          onDisconnected();
-        }
+  const subscribe = useCallback(
+    (packetType: PacketType, handler: (packet: any) => void) => {
+      if (!messageHandlersRef.current.has(packetType)) {
+        messageHandlersRef.current.set(packetType, []);
       }
-    };
-  }, [socket, conference, onDisconnected]);
+      messageHandlersRef.current.get(packetType)!.push(handler);
+
+      // Return unsubscribe function
+      return () => {
+        const handlers = messageHandlersRef.current.get(packetType) || [];
+        const index = handlers.indexOf(handler);
+        if (index > -1) {
+          handlers.splice(index, 1);
+        }
+      };
+    },
+    []
+  );
+
+  // ==================== DEBUG ====================
+
+  const debugState = useCallback(() => {
+    console.group("🔌 Connection Manager State");
+    console.log("Connected:", connected);
+    console.log("Connecting:", connecting);
+    console.log("Error:", error);
+    console.log("Room:", roomId);
+    console.log("Node ID:", nodeIdRef.current);
+    console.log("Speaker ID:", speakerIdRef.current);
+    console.log("Sequence Number:", sequenceNumberRef.current);
+    console.log("Using Mock Server:", useMockServer);
+    console.log("Mock Server:", mockServerRef.current ? "Active" : "Inactive");
+    console.groupEnd();
+  }, [connected, connecting, error, roomId, useMockServer]);
 
   // ==================== PUBLIC API ====================
 
   return {
     // Connection state
-    connected: socket.connected,
-    connecting: socket.connecting,
-    error: socket.error,
+    connected,
+    connecting,
+    error,
 
     // Identifiers
     nodeId: nodeIdRef.current,
@@ -173,21 +234,14 @@ export function useConnectionManager(config: ConnectionManagerConfig) {
     roomId,
 
     // Methods
-    sendPacket: socket.sendPacket,
-    subscribe: socket.subscribe,
+    sendPacket,
+    subscribe,
     getSequenceNumber: () => ++sequenceNumberRef.current,
 
     // Debug
-    debugState: () => {
-      console.group("Connection Manager State");
-      console.log("Connected:", socket.connected);
-      console.log("Room:", roomId);
-      console.log("Node ID:", nodeIdRef.current);
-      console.log("Speaker ID:", speakerIdRef.current);
-      console.log("Sequence Number:", sequenceNumberRef.current);
-      console.log("Queue Size:", socket.getQueueSize());
-      console.log("Handler Count:", socket.getHandlerCount());
-      console.groupEnd();
-    },
+    debugState,
+
+    // Info
+    isMockMode: useMockServer,
   };
 }
